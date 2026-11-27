@@ -24,6 +24,8 @@ checked 16 Nov 2026) and the CHUI portal (`ondemand.vlab.ac.ke`):
 | GPU request | `--partition=gpu1 --gres=gpu:1` | wiki |
 | QOS | `gpu_only` (at most 2 GPUs), `cpu_only`, `debug`, `normal` | wiki "Slurm" |
 | Modules | Lmod; `module load applications/gpu/python/conda-25.1.1-python-3.9.21` gives conda with a shared `python-3.9.21` env | wiki "PyTorch and Tensorflow" |
+| Login node | `controller-icolo.kenet.or.ke`: has internet, but **not** the `applications/gpu/...` modules (those exist only on GPU nodes). `setup_env.sh` therefore finds or installs conda itself (shared `/opt/ohpc/pub/conda/instdir`, else Miniforge in `~/miniforge3`) | seen on Chui, 24 Nov 2026 |
+| Compute nodes (incl. JupyterLab) | **no internet**; jobs only use the env and model cache that setup made | seen on Chui, 24 Nov 2026 |
 | Scratch | `~/localscratch` ("your scratch directory") | wiki |
 | Interactive GPU shell | `srun --time=00:30:00 --gres=gpu:1 --partition=gpu1 --pty /bin/bash -i` | wiki |
 | Web portal | Open OnDemand at `ondemand.vlab.ac.ke` (JupyterLab, VS Code, TensorBoard) | portal |
@@ -53,6 +55,8 @@ group), 10 tasks, each saving every finished run immediately.
 | `slurm/submit_all.sh` | Submits the array plus a summary job that runs after it |
 | `slurm/aggregate.sbatch` | Mean ± std over seeds from all finished runs (CPU job) |
 | `run_v7_chui.ipynb` | The same workflow from JupyterLab on Chui's Open OnDemand portal (see "Running from Jupyter") |
+| `slurm/submit_replay_study.sh` | v7.2: submits the supervisor's replay study and the LoRA+ re-run (see "Replay study") |
+| `tools/replay_study_report.py` | v7.2: tables, paired tests and CSV files for the replay study (no GPU) |
 
 ## Step by step
 
@@ -115,10 +119,10 @@ If you keep the code elsewhere or want results somewhere other than
 bash slurm/setup_env.sh
 ```
 
-This creates a Python 3.11 conda env in `~/envs/ncl_v7`, installs
+This creates a self-contained Python 3.11 conda env in `~/envs/ncl_v7` (using the cluster's conda if it can find one, otherwise installing Miniforge in `~/miniforge3`), installs
 `requirements.txt`, removes `torchao`, downloads Qwen2.5-1.5B (~3 GB) to
 `~/localscratch/thesis_v7/hf_cache`, exports the 5 Sheng eras, generates the
-20-era synthetic stream, and writes the exact package versions to
+10-era synthetic stream, and writes the exact package versions to
 `~/localscratch/thesis_v7/environment.txt` (quote these in the thesis).
 
 If `conda create` cannot reach its channels, the script falls back to a venv
@@ -283,6 +287,86 @@ python run_experiment.py --storage-root ./experiment_data --seeds 42 43 44 45 46
 On Colab, use `--storage-root /content/drive/MyDrive/thesis_experiments`
 (v7 no longer finds Google Drive by itself). Without `--storage-root` or
 `EXPERIMENT_ROOT`, files go to `./experiment_data`.
+
+## Ablations and partial re-runs (v7.1 flags)
+
+| Flag | What it changes | Use |
+|---|---|---|
+| `--eras N` | Synthetic eras (default 10, max 20). Run `--prepare-data --eras N` first | Keep the 20-era design of the proposal |
+| `--buffer-capacity K` | Novel's replay buffer (default 1000). `0` = Novel without replay | Replay ablation (does the buffer help?), buffer-size ablation |
+| `--replay-batch B` | Buffer samples per mini-batch of 16 new ones (default 16) | Replay-ratio ablation |
+| `--lora-r R` | LoRA rank of every adapter method; alpha = 2R | Rank ablation (H5) |
+| `--include-store DIR` | With `--aggregate-only`: also read finished runs from another `checkpoints/v7_<hash>` folder | Combine re-run models (e.g. fixed LoRA+) with earlier runs in one table |
+
+Each combination of these settings gets its own folder of finished runs, so
+ablations never overwrite the main results. Pass them through `EXTRA_ARGS`:
+
+```bash
+python run_experiment.py --prepare-data --eras 20          # once, on the login node
+MODEL_GROUPS=loraplus EXTRA_ARGS="--eras 20" bash slurm/submit_all.sh                       # fixed LoRA+, 5 seeds
+MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --buffer-capacity 0" bash slurm/submit_all.sh      # Novel without replay
+for r in 4 16; do SEEDS="42 43 44" MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --lora-r $r" bash slurm/submit_all.sh; done
+for k in 250 500 2000; do SEEDS="42 43 44" MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --buffer-capacity $k" bash slurm/submit_all.sh; done
+```
+
+## Replay study (v7.2, supervisor's comments of 27 Nov 2026)
+
+Three questions, all at the 20 eras of the main results:
+
+| Question | Arms | Model names (`--models`) |
+|---|---|---|
+| Does rehearsal help only the low-rank adapter, or full fine-tuning too? | LoRA adapter and full fine-tuning, each with and without replay | `novel`, `novel_noreplay`, `naive_replay`, `naive` |
+| Is the gain from replay itself, or from seeing more examples? | No replay at **equal exposure**: each mini-batch of 16 new samples gets 16 more drawn again from the current era, so the arm takes the same optimizer updates on the same number of examples as its replay arm | `novel_matched`, `naive_matched` |
+| How small can the buffer be? | Capacity 64, 256, 1000 and the complete history (`--buffer-capacity all`), replay ratio fixed at 16 replayed per 16 new | `novel`, `naive_replay` |
+
+`--models replay_study` is the six arms of the first two rows. Every run of
+every method now records optimizer updates, examples (new, replayed,
+resampled) and tokens processed (non-padding and padded), in total and per
+era. Replay runs also record, after each era, the buffer occupancy, how many
+samples of each past era it still holds, and how many replayed samples came
+from each era. They are in each run's JSON (`era_log`) and the summary tables
+gain Optimizer updates, Examples and Tokens columns.
+
+Run everything (about 10 to 12 GPU-hours over 5 seeds, roughly 6 hours on 2 GPUs):
+
+```bash
+source slurm/chui_env.sh && load_python_env
+python run_experiment.py --prepare-data --eras 20     # once; skip if already done
+bash slurm/submit_replay_study.sh                     # design + capacity + LoRA+ re-run
+# or one part at a time:  PARTS="design loraplus" bash slurm/submit_replay_study.sh
+```
+
+All jobs use `--ft-mode full`, so the "Naive FT" arms are full fine-tuning.
+When the jobs have finished (partial results work too):
+
+```bash
+python tools/replay_study_report.py --eras 20
+```
+
+It writes `experiments/replay_study_<time>.md` with three tables (update method x
+replay with paired t-tests and Holm correction, including whether replay
+helps LoRA more than full fine-tuning; the capacity sweep with final occupancy
+and era coverage), plus `_design.csv`, `_capacity.csv` and `_era_coverage.csv`
+(one row per run, era and past era) for plots.
+
+## v7.1 changes (25 Nov 2026)
+
+After the first full array on Chui (job 62506):
+
+| Area | v7 | v7.1 |
+|---|---|---|
+| Synthetic eras | 20 | **10** (`Config.NUM_TIME_STEPS`). The drift schedule is rescaled, so every planted event still happens: emerge (era 2), meaning shifts (3), reversal R1 (4), emerge + obsolete (5), prior shift (6), reversal R2 (7), R1 reverted + prior shift (8), emerge + obsolete (9). Sheng keeps its 5 eras |
+| LoRA+ learning rates | A at 2e-4, B at 3.2e-3 (16x). On the synthetic stream this diverged in every seed: train loss stuck at ln 3 = 1.099 (uniform predictions), AA 0.30-0.38, Macro-F1 0.15-0.37 | A at 5e-5, B at 8e-4 (still 16x, as in PEFT's LoRA+ example), head at 2e-4 like every other method (`Config.LORAPLUS_LR`) |
+| Collapse check | none | A run whose last three train losses are within 0.03 of ln K prints a warning and is stored with `"collapsed": true` |
+| Run key | | Adds `synthetic_eras` and `loraplus_lr`, so v7 runs (20 eras, old LoRA+) are never reused by `--resume`; the old results stay on disk in their own folder |
+
+Reading the logs: the summary table's columns are AA, AF, FWT, BWT, Macro-F1,
+Time, Trainable %, **CPU %**, RAM, GPU. CPU % near 100 means the Python
+process kept one core busy, which is normal while it drives the GPU; it is not
+an accuracy. Static's AA near 0.35 (chance for 3 classes) and Periodic-Sheng's
+AF of exactly 0 are expected from their designs (Static's head is trained on
+era 1 only; on Sheng, Periodic retrains only at era 3, so earlier eras can only
+improve).
 
 ## What changed from v6
 
