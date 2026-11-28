@@ -55,8 +55,8 @@ group), 10 tasks, each saving every finished run immediately.
 | `slurm/submit_all.sh` | Submits the array plus a summary job that runs after it |
 | `slurm/aggregate.sbatch` | Mean ± std over seeds from all finished runs (CPU job) |
 | `run_v7_chui.ipynb` | The same workflow from JupyterLab on Chui's Open OnDemand portal (see "Running from Jupyter") |
-| `slurm/submit_replay_study.sh` | v7.2: submits the supervisor's replay study and the LoRA+ re-run (see "Replay study") |
-| `tools/replay_study_report.py` | v7.2: tables, paired tests and CSV files for the replay study (no GPU) |
+| `slurm/submit_replay_study.sh` | v7.2: submits the pending experiments, replay study and rank ablation (see "Pending experiments") |
+| `tools/replay_study_report.py` | v7.2: tables, paired tests and CSV files for the replay study and rank ablation (no GPU) |
 
 ## Step by step
 
@@ -299,55 +299,63 @@ On Colab, use `--storage-root /content/drive/MyDrive/thesis_experiments`
 | `--include-store DIR` | With `--aggregate-only`: also read finished runs from another `checkpoints/v7_<hash>` folder | Combine re-run models (e.g. fixed LoRA+) with earlier runs in one table |
 
 Each combination of these settings gets its own folder of finished runs, so
-ablations never overwrite the main results. Pass them through `EXTRA_ARGS`:
+ablations never overwrite the main results. Pass them through `EXTRA_ARGS`,
+for example one extra run of Novel without replay:
 
 ```bash
-python run_experiment.py --prepare-data --eras 20          # once, on the login node
-MODEL_GROUPS=loraplus EXTRA_ARGS="--eras 20" bash slurm/submit_all.sh                       # fixed LoRA+, 5 seeds
-MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --buffer-capacity 0" bash slurm/submit_all.sh      # Novel without replay
-for r in 4 16; do SEEDS="42 43 44" MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --lora-r $r" bash slurm/submit_all.sh; done
-for k in 250 500 2000; do SEEDS="42 43 44" MODEL_GROUPS=novel EXTRA_ARGS="--eras 20 --buffer-capacity $k" bash slurm/submit_all.sh; done
+MODEL_GROUPS=novel EXTRA_ARGS="--eras 10 --buffer-capacity 0" bash slurm/submit_all.sh
 ```
 
-## Replay study (v7.2, supervisor's comments of 27 Nov 2026)
+The planned ablations (replay, buffer capacity, rank) are all submitted by
+`slurm/submit_replay_study.sh`; see the next section.
 
-Three questions, all at the 20 eras of the main results:
+## Pending experiments: replay study and rank ablation (v7.2)
+
+The main results are the 10-era run of 27 Nov (job 63010: all 7 methods, 5
+seeds, LoRA+ fixed). Everything still pending runs at the same 10 eras and
+5 seeds with one script:
 
 | Question | Arms | Model names (`--models`) |
 |---|---|---|
 | Does rehearsal help only the low-rank adapter, or full fine-tuning too? | LoRA adapter and full fine-tuning, each with and without replay | `novel`, `novel_noreplay`, `naive_replay`, `naive` |
 | Is the gain from replay itself, or from seeing more examples? | No replay at **equal exposure**: each mini-batch of 16 new samples gets 16 more drawn again from the current era, so the arm takes the same optimizer updates on the same number of examples as its replay arm | `novel_matched`, `naive_matched` |
 | How small can the buffer be? | Capacity 64, 256, 1000 and the complete history (`--buffer-capacity all`), replay ratio fixed at 16 replayed per 16 new | `novel`, `naive_replay` |
+| Does the LoRA rank matter (H5)? | Novel at r = 4, 8, 16 (alpha = 2r); r = 8 is the design part's Novel run | `novel` with `--lora-r` |
 
 `--models replay_study` is the six arms of the first two rows. Every run of
-every method now records optimizer updates, examples (new, replayed,
-resampled) and tokens processed (non-padding and padded), in total and per
-era. Replay runs also record, after each era, the buffer occupancy, how many
-samples of each past era it still holds, and how many replayed samples came
-from each era. They are in each run's JSON (`era_log`) and the summary tables
-gain Optimizer updates, Examples and Tokens columns.
+every method records optimizer updates, examples (new, replayed, resampled)
+and tokens processed (non-padding and padded), in total and per era. Replay
+runs also record, after each era, the buffer occupancy, how many samples of
+each past era it still holds, and how many replayed samples came from each
+era (`era_log` in each run's JSON).
 
-Run everything (about 10 to 12 GPU-hours over 5 seeds, roughly 6 hours on 2 GPUs):
+Run everything (about 5 GPU-hours, roughly 3 hours on 2 GPUs):
 
 ```bash
+cd ~/novel_continual_learning_v7
 source slurm/chui_env.sh && load_python_env
-python run_experiment.py --prepare-data --eras 20     # once; skip if already done
-bash slurm/submit_replay_study.sh                     # design + capacity + LoRA+ re-run
-# or one part at a time:  PARTS="design loraplus" bash slurm/submit_replay_study.sh
+squeue -u $USER                                   # nothing of yours should be queued
+python run_experiment.py --prepare-data --eras 10 # the data folder holds one era count at a time
+bash slurm/submit_replay_study.sh                 # design + capacity + rank
+# one part at a time:  PARTS="design" bash slurm/submit_replay_study.sh
 ```
 
 All jobs use `--ft-mode full`, so the "Naive FT" arms are full fine-tuning.
+The synthetic data folder holds one era count at a time, so do not run
+`--prepare-data` with another `--eras` while jobs are queued: tasks that have
+not started yet would stop with a data mismatch.
+
 When the jobs have finished (partial results work too):
 
 ```bash
-python tools/replay_study_report.py --eras 20
+python tools/replay_study_report.py          # 10-era runs by default
 ```
 
-It writes `experiments/replay_study_<time>.md` with three tables (update method x
-replay with paired t-tests and Holm correction, including whether replay
-helps LoRA more than full fine-tuning; the capacity sweep with final occupancy
-and era coverage), plus `_design.csv`, `_capacity.csv` and `_era_coverage.csv`
-(one row per run, era and past era) for plots.
+It writes `experiments/replay_study_<time>.md` with the tables (update method x
+replay with paired t-tests and Holm correction, including whether replay helps
+LoRA more than full fine-tuning; the capacity sweep with final occupancy and
+era coverage; LoRA rank against r = 8), plus `_design.csv`, `_capacity.csv`,
+`_era_coverage.csv` (one row per run, era and past era) and `_rank.csv`.
 
 ## v7.1 changes (25 Nov 2026)
 
